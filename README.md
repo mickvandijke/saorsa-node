@@ -725,7 +725,7 @@ saorsa-node --upgrade-channel beta
 [upgrade]
 enabled = true
 channel = "stable"
-check_interval_hours = 1
+check_interval_minutes = 20
 github_repo = "saorsa-labs/saorsa-node"
 # max_random_delay_hours = 24  # For staged rollout
 ```
@@ -908,7 +908,7 @@ bootstrap = [
 [upgrade]
 enabled = true
 channel = "stable"
-check_interval_hours = 1
+check_interval_minutes = 20
 github_repo = "saorsa-labs/saorsa-node"
 
 [migration]
