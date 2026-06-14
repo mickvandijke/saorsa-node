@@ -4,6 +4,11 @@ use evmlib::Network as EvmNetwork;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "audit-exploit-test")]
+use std::time::Duration;
+
+#[cfg(feature = "audit-exploit-test")]
+use crate::replication::config::ReplicationConfig;
 
 /// Filename for the persisted node identity keypair.
 pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
@@ -35,6 +40,97 @@ pub enum NetworkMode {
     /// Development mode with minimal restrictions.
     /// Only use for local testing.
     Development,
+}
+
+/// Storage behavior used by controlled audit exploit testnets.
+///
+/// `Honest` is the production/default behavior. The non-honest variants are
+/// intentionally feature-gated hooks for measuring replication and audit
+/// resistance against nodes that accept or claim data while discarding bytes.
+#[cfg(feature = "audit-exploit-test")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageBehavior {
+    /// Store records normally and answer audits from local storage.
+    #[default]
+    Honest,
+    /// Accept storage responsibility but never persist chunk bytes.
+    Blackhole,
+    /// Discard chunk bytes, but try to fetch challenged records on audit.
+    LazyAuditFetch,
+}
+
+#[cfg(feature = "audit-exploit-test")]
+impl StorageBehavior {
+    /// Does this behavior discard records instead of persisting them?
+    #[must_use]
+    pub fn discards_chunks(self) -> bool {
+        matches!(self, Self::Blackhole | Self::LazyAuditFetch)
+    }
+
+    /// Does this behavior claim keys as locally present during verification?
+    #[must_use]
+    pub fn claims_chunks_present(self) -> bool {
+        self.discards_chunks()
+    }
+
+    /// Does this behavior try to outsource audit answers just-in-time?
+    #[must_use]
+    pub fn lazy_fetches_on_audit(self) -> bool {
+        matches!(self, Self::LazyAuditFetch)
+    }
+}
+
+/// Timing overrides used by controlled audit exploit testnets.
+///
+/// All fields are optional so enabling the feature alone does not change normal
+/// replication timing. The test harness opts in explicitly per run.
+#[cfg(feature = "audit-exploit-test")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditExploitTestConfig {
+    /// Minimum audit scheduler cadence in seconds.
+    pub audit_tick_interval_min_secs: Option<u64>,
+    /// Maximum audit scheduler cadence in seconds.
+    pub audit_tick_interval_max_secs: Option<u64>,
+    /// Minimum neighbor-sync cadence in seconds.
+    pub neighbor_sync_interval_min_secs: Option<u64>,
+    /// Maximum neighbor-sync cadence in seconds.
+    pub neighbor_sync_interval_max_secs: Option<u64>,
+    /// Per-peer minimum spacing between successive neighbor syncs in seconds.
+    pub neighbor_sync_cooldown_secs: Option<u64>,
+}
+
+#[cfg(feature = "audit-exploit-test")]
+impl AuditExploitTestConfig {
+    /// Do any replication timing overrides exist?
+    #[must_use]
+    pub fn has_replication_overrides(&self) -> bool {
+        self.audit_tick_interval_min_secs.is_some()
+            || self.audit_tick_interval_max_secs.is_some()
+            || self.neighbor_sync_interval_min_secs.is_some()
+            || self.neighbor_sync_interval_max_secs.is_some()
+            || self.neighbor_sync_cooldown_secs.is_some()
+    }
+
+    /// Apply configured timing overrides to replication parameters.
+    pub fn apply_to_replication_config(&self, config: &mut ReplicationConfig) {
+        if let Some(seconds) = self.audit_tick_interval_min_secs {
+            config.audit_tick_interval_min = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = self.audit_tick_interval_max_secs {
+            config.audit_tick_interval_max = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = self.neighbor_sync_interval_min_secs {
+            config.neighbor_sync_interval_min = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = self.neighbor_sync_interval_max_secs {
+            config.neighbor_sync_interval_max = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = self.neighbor_sync_cooldown_secs {
+            config.neighbor_sync_cooldown = Duration::from_secs(seconds);
+        }
+    }
 }
 
 /// Testnet-specific configuration for relaxed IP diversity limits.
@@ -119,6 +215,11 @@ pub struct NodeConfig {
     /// Storage configuration for chunk persistence.
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Controlled audit exploit test overrides.
+    #[cfg(feature = "audit-exploit-test")]
+    #[serde(default)]
+    pub audit_exploit_test: AuditExploitTestConfig,
 
     /// Directory for persisting the close group cache.
     ///
@@ -279,6 +380,8 @@ impl Default for NodeConfig {
             upgrade: UpgradeConfig::default(),
             payment: PaymentConfig::default(),
             storage: StorageConfig::default(),
+            #[cfg(feature = "audit-exploit-test")]
+            audit_exploit_test: AuditExploitTestConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
@@ -417,6 +520,13 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_enabled")]
     pub enabled: bool,
 
+    /// Storage behavior override for controlled audit exploit testnets.
+    /// Default: honest storage. Non-honest modes are rejected in production
+    /// network mode.
+    #[cfg(feature = "audit-exploit-test")]
+    #[serde(default)]
+    pub behavior: StorageBehavior,
+
     /// Verify content hash matches address on read.
     /// Default: true
     #[serde(default = "default_storage_verify_on_read")]
@@ -442,6 +552,8 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             enabled: default_storage_enabled(),
+            #[cfg(feature = "audit-exploit-test")]
+            behavior: StorageBehavior::default(),
             verify_on_read: default_storage_verify_on_read(),
             db_size_gb: 0,
             disk_reserve_mb: default_disk_reserve_mb(),

@@ -144,6 +144,10 @@ logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Expose test helpers (cache_insert, payment_verifier accessor) for
 # integration tests and downstream test harnesses.
 test-utils = []
+# Controlled exploit harness hooks for replication/audit testing. This is
+# excluded from default builds so normal ant-node binaries do not include
+# non-honest storage behavior or the associated CLI surface.
+audit-exploit-test = []
 
 [profile.release]
 lto = true

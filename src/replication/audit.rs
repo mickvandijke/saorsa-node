@@ -4,8 +4,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "audit-exploit-test")]
+use std::time::Duration;
 
 use crate::logging::{debug, info, warn};
+#[cfg(feature = "audit-exploit-test")]
+use futures::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
 use rand::Rng;
 
@@ -22,6 +26,25 @@ use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
+
+/// Maximum keys a lazy-audit-fetch test node accepts in one challenge.
+#[cfg(feature = "audit-exploit-test")]
+const MAX_LAZY_AUDIT_CHALLENGE_KEYS: usize = 64;
+
+/// Maximum peers a lazy-audit-fetch test node asks for one challenged key.
+#[cfg(feature = "audit-exploit-test")]
+const MAX_LAZY_AUDIT_FETCH_CANDIDATES: usize = 8;
+
+/// Maximum challenged keys a lazy-audit-fetch test node fetches concurrently.
+#[cfg(feature = "audit-exploit-test")]
+const MAX_LAZY_AUDIT_PARALLEL_KEYS: usize = 8;
+
+/// Per-peer fetch timeout for lazy audit outsourcing attempts.
+///
+/// This stays below the normal audit response deadline so failed candidate
+/// fetches do not consume the whole audit window.
+#[cfg(feature = "audit-exploit-test")]
+const LAZY_AUDIT_FETCH_PER_PEER_TIMEOUT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Audit tick result
@@ -710,6 +733,246 @@ pub async fn handle_audit_challenge(
         challenge_id: challenge.challenge_id,
         digests,
     }
+}
+
+/// Handle an incoming audit challenge by trying to fetch absent records from
+/// neighboring peers before computing the digest.
+///
+/// This is deliberately compiled only for controlled audit exploit testing. It
+/// does not persist fetched bytes; it only holds them long enough to answer the
+/// current audit challenge.
+#[cfg(feature = "audit-exploit-test")]
+pub async fn handle_audit_challenge_with_lazy_fetch(
+    challenge: &AuditChallenge,
+    storage: &LmdbStorage,
+    p2p_node: &Arc<P2PNode>,
+    challenge_source: &PeerId,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+) -> AuditResponse {
+    if let Some(response) =
+        lazy_audit_challenge_preflight(challenge, p2p_node.peer_id(), is_bootstrapping)
+    {
+        return response;
+    }
+
+    let nonce = challenge.nonce;
+    let challenged_peer_id = challenge.challenged_peer_id;
+    let mut indexed_digests = stream::iter(challenge.keys.iter().copied().enumerate())
+        .map(|(index, key)| async move {
+            let digest = digest_key_with_lazy_fetch(
+                key,
+                nonce,
+                challenged_peer_id,
+                storage,
+                p2p_node,
+                challenge_source,
+                config,
+            )
+            .await;
+            (index, digest)
+        })
+        .buffer_unordered(MAX_LAZY_AUDIT_PARALLEL_KEYS)
+        .collect::<Vec<_>>()
+        .await;
+
+    indexed_digests.sort_unstable_by_key(|(index, _)| *index);
+    let digests = indexed_digests
+        .into_iter()
+        .map(|(_, digest)| digest)
+        .collect();
+
+    AuditResponse::Digests {
+        challenge_id: challenge.challenge_id,
+        digests,
+    }
+}
+
+#[cfg(feature = "audit-exploit-test")]
+fn lazy_audit_challenge_preflight(
+    challenge: &AuditChallenge,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+) -> Option<AuditResponse> {
+    if is_bootstrapping {
+        return Some(AuditResponse::Bootstrapping {
+            challenge_id: challenge.challenge_id,
+        });
+    }
+
+    if challenge.challenged_peer_id != *self_peer_id.as_bytes() {
+        warn!(
+            "Audit challenge targeted wrong peer: expected {}, got {}",
+            hex::encode(self_peer_id.as_bytes()),
+            hex::encode(challenge.challenged_peer_id),
+        );
+        return Some(AuditResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: "challenged_peer_id does not match this node".to_string(),
+        });
+    }
+
+    if challenge.keys.len() > MAX_LAZY_AUDIT_CHALLENGE_KEYS {
+        warn!(
+            "Lazy audit challenge rejected: {} keys exceeds limit of {}",
+            challenge.keys.len(),
+            MAX_LAZY_AUDIT_CHALLENGE_KEYS,
+        );
+        return Some(AuditResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            reason: format!(
+                "challenge contains {} keys, limit is {}",
+                challenge.keys.len(),
+                MAX_LAZY_AUDIT_CHALLENGE_KEYS,
+            ),
+        });
+    }
+
+    None
+}
+
+#[cfg(feature = "audit-exploit-test")]
+#[allow(clippy::too_many_arguments)]
+async fn digest_key_with_lazy_fetch(
+    key: XorName,
+    nonce: [u8; 32],
+    challenged_peer_id: [u8; 32],
+    storage: &LmdbStorage,
+    p2p_node: &Arc<P2PNode>,
+    challenge_source: &PeerId,
+    config: &ReplicationConfig,
+) -> [u8; 32] {
+    match storage.get_raw(&key).await {
+        Ok(Some(data)) => return compute_audit_digest(&nonce, &challenged_peer_id, &key, &data),
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "Lazy audit responder: failed to read key {} locally: {e}",
+                hex::encode(key),
+            );
+        }
+    }
+
+    fetch_record_for_audit(&key, p2p_node, challenge_source, config)
+        .await
+        .map_or(ABSENT_KEY_DIGEST, |data| {
+            compute_audit_digest(&nonce, &challenged_peer_id, &key, &data)
+        })
+}
+
+#[cfg(feature = "audit-exploit-test")]
+async fn fetch_record_for_audit(
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    challenge_source: &PeerId,
+    config: &ReplicationConfig,
+) -> Option<Vec<u8>> {
+    let self_peer = *p2p_node.peer_id();
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, config.close_group_size)
+        .await;
+
+    for peer in closest
+        .iter()
+        .map(|node| node.peer_id)
+        .filter(|peer| *peer != self_peer && peer != challenge_source)
+        .take(MAX_LAZY_AUDIT_FETCH_CANDIDATES)
+    {
+        if let Some(data) = fetch_record_from_peer_for_audit(key, &peer, p2p_node).await {
+            return Some(data);
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "audit-exploit-test")]
+async fn fetch_record_from_peer_for_audit(
+    key: &XorName,
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+) -> Option<Vec<u8>> {
+    let request = crate::replication::protocol::FetchRequest { key: *key };
+    let msg = ReplicationMessage {
+        request_id: rand::thread_rng().gen::<u64>(),
+        body: ReplicationMessageBody::FetchRequest(request),
+    };
+    let encoded = match msg.encode() {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Lazy audit responder: failed to encode fetch request: {e}");
+            return None;
+        }
+    };
+
+    let response = match p2p_node
+        .send_request(
+            peer,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            LAZY_AUDIT_FETCH_PER_PEER_TIMEOUT,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            debug!(
+                "Lazy audit responder: fetch from {peer} for {} failed: {e}",
+                hex::encode(key),
+            );
+            return None;
+        }
+    };
+
+    let resp_msg = match ReplicationMessage::decode(&response.data) {
+        Ok(msg) => msg,
+        Err(e) => {
+            warn!("Lazy audit responder: failed to decode fetch response from {peer}: {e}");
+            return None;
+        }
+    };
+
+    let ReplicationMessageBody::FetchResponse(
+        crate::replication::protocol::FetchResponse::Success {
+            key: resp_key,
+            data,
+        },
+    ) = resp_msg.body
+    else {
+        return None;
+    };
+
+    if resp_key != *key {
+        warn!(
+            "Lazy audit responder: fetch key mismatch from {peer}: requested {}, got {}",
+            hex::encode(key),
+            hex::encode(resp_key),
+        );
+        return None;
+    }
+
+    if data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+        warn!(
+            "Lazy audit responder: fetched record {} too large ({} > {})",
+            hex::encode(resp_key),
+            data.len(),
+            crate::ant_protocol::MAX_CHUNK_SIZE,
+        );
+        return None;
+    }
+
+    let computed = crate::client::compute_address(&data);
+    if computed != resp_key {
+        warn!(
+            "Lazy audit responder: fetched record integrity check failed: expected {}, got {}",
+            hex::encode(resp_key),
+            hex::encode(computed),
+        );
+        return None;
+    }
+
+    Some(data)
 }
 
 // ---------------------------------------------------------------------------

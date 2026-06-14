@@ -4,6 +4,8 @@
 //! multi-node networks on a single machine.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+#[cfg(feature = "audit-exploit-test")]
+use crate::config::StorageBehavior;
 use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
 use crate::logging::{debug, info, warn};
 use crate::payment::{
@@ -570,6 +572,8 @@ impl Devnet {
             storage,
             payment_verifier,
             Arc::new(quote_generator),
+            #[cfg(feature = "audit-exploit-test")]
+            StorageBehavior::Honest,
         ))
     }
 

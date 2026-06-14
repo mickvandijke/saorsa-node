@@ -1,5 +1,7 @@
 //! Command-line interface definition.
 
+#[cfg(feature = "audit-exploit-test")]
+use ant_node::config::StorageBehavior;
 use ant_node::config::{
     BootstrapPeersConfig, BootstrapSource, EvmNetworkConfig, NetworkMode, NodeConfig,
     PaymentConfig, UpgradeChannel,
@@ -124,6 +126,44 @@ pub struct Cli {
     )]
     pub network_mode: CliNetworkMode,
 
+    /// Storage behavior override for controlled audit exploit testnets.
+    ///
+    /// Non-honest values are rejected in production network mode. This flag is
+    /// compiled only with the `audit-exploit-test` feature.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "honest",
+        env = "ANT_STORAGE_BEHAVIOR"
+    )]
+    pub storage_behavior: CliStorageBehavior,
+
+    /// Minimum audit scheduler cadence in seconds for controlled audit tests.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(long, env = "ANT_AUDIT_TICK_INTERVAL_MIN_SECS")]
+    pub audit_tick_interval_min_secs: Option<u64>,
+
+    /// Maximum audit scheduler cadence in seconds for controlled audit tests.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(long, env = "ANT_AUDIT_TICK_INTERVAL_MAX_SECS")]
+    pub audit_tick_interval_max_secs: Option<u64>,
+
+    /// Minimum neighbor-sync cadence in seconds for controlled audit tests.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(long, env = "ANT_NEIGHBOR_SYNC_INTERVAL_MIN_SECS")]
+    pub neighbor_sync_interval_min_secs: Option<u64>,
+
+    /// Maximum neighbor-sync cadence in seconds for controlled audit tests.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(long, env = "ANT_NEIGHBOR_SYNC_INTERVAL_MAX_SECS")]
+    pub neighbor_sync_interval_max_secs: Option<u64>,
+
+    /// Per-peer neighbor-sync cooldown in seconds for controlled audit tests.
+    #[cfg(feature = "audit-exploit-test")]
+    #[arg(long, env = "ANT_NEIGHBOR_SYNC_COOLDOWN_SECS")]
+    pub neighbor_sync_cooldown_secs: Option<u64>,
+
     /// Path to configuration file.
     #[arg(long, short)]
     pub config: Option<PathBuf>,
@@ -198,6 +238,20 @@ pub enum CliNetworkMode {
     Development,
 }
 
+/// Storage behavior CLI enum for controlled audit exploit testnets.
+#[cfg(feature = "audit-exploit-test")]
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum CliStorageBehavior {
+    /// Store records normally and answer audits from local storage.
+    #[default]
+    Honest,
+    /// Accept storage responsibility but never persist chunk bytes.
+    Blackhole,
+    /// Discard chunk bytes, but try to fetch challenged records on audit.
+    #[value(name = "lazy-audit-fetch")]
+    LazyAuditFetch,
+}
+
 impl Cli {
     /// Convert CLI arguments into a `NodeConfig` and the source of bootstrap peers.
     ///
@@ -235,6 +289,25 @@ impl Cli {
             config.log_level = self.log_level.into();
         }
         config.network_mode = self.network_mode.into();
+        #[cfg(feature = "audit-exploit-test")]
+        {
+            config.storage.behavior = self.storage_behavior.into();
+            if let Some(seconds) = self.audit_tick_interval_min_secs {
+                config.audit_exploit_test.audit_tick_interval_min_secs = Some(seconds);
+            }
+            if let Some(seconds) = self.audit_tick_interval_max_secs {
+                config.audit_exploit_test.audit_tick_interval_max_secs = Some(seconds);
+            }
+            if let Some(seconds) = self.neighbor_sync_interval_min_secs {
+                config.audit_exploit_test.neighbor_sync_interval_min_secs = Some(seconds);
+            }
+            if let Some(seconds) = self.neighbor_sync_interval_max_secs {
+                config.audit_exploit_test.neighbor_sync_interval_max_secs = Some(seconds);
+            }
+            if let Some(seconds) = self.neighbor_sync_cooldown_secs {
+                config.audit_exploit_test.neighbor_sync_cooldown_secs = Some(seconds);
+            }
+        }
 
         // Apply CLI bootstrap peers if provided; otherwise keep config file value.
         if cli_bootstrap_provided {
@@ -329,6 +402,17 @@ impl From<CliNetworkMode> for NetworkMode {
             CliNetworkMode::Production => Self::Production,
             CliNetworkMode::Testnet => Self::Testnet,
             CliNetworkMode::Development => Self::Development,
+        }
+    }
+}
+
+#[cfg(feature = "audit-exploit-test")]
+impl From<CliStorageBehavior> for StorageBehavior {
+    fn from(behavior: CliStorageBehavior) -> Self {
+        match behavior {
+            CliStorageBehavior::Honest => Self::Honest,
+            CliStorageBehavior::Blackhole => Self::Blackhole,
+            CliStorageBehavior::LazyAuditFetch => Self::LazyAuditFetch,
         }
     }
 }

@@ -18,6 +18,8 @@ use ant_node::ant_protocol::{
     ChunkPutResponse, CHUNK_PROTOCOL_ID, MAX_WIRE_MESSAGE_SIZE,
 };
 use ant_node::client::{send_and_await_chunk_response, DataChunk, XorName};
+#[cfg(feature = "audit-exploit-test")]
+use ant_node::config::StorageBehavior;
 use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -1134,6 +1136,8 @@ impl TestNetwork {
             Arc::new(storage),
             Arc::new(payment_verifier),
             Arc::new(quote_generator),
+            #[cfg(feature = "audit-exploit-test")]
+            StorageBehavior::Honest,
         ))
     }
 
@@ -1251,6 +1255,8 @@ impl TestNetwork {
                 protocol.payment_verifier_arc(),
                 &node.data_dir,
                 fresh_rx,
+                #[cfg(feature = "audit-exploit-test")]
+                StorageBehavior::Honest,
                 shutdown.clone(),
             )
             .await

@@ -43,6 +43,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
+#[cfg(feature = "audit-exploit-test")]
+use crate::config::StorageBehavior;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
@@ -149,6 +151,9 @@ pub struct ReplicationEngine {
     /// When present, `start()` spawns a drainer task that calls
     /// `replicate_fresh` for each event.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Controlled audit exploit storage behavior.
+    #[cfg(feature = "audit-exploit-test")]
+    storage_behavior: StorageBehavior,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -162,6 +167,9 @@ impl ReplicationEngine {
     ///
     /// Returns an error if the `PaidList` LMDB environment cannot be opened
     /// or if the configuration fails validation.
+    // The extra storage-behavior argument is compiled only for the audit
+    // exploit harness; normal builds keep the production signature unchanged.
+    #[cfg_attr(feature = "audit-exploit-test", allow(clippy::too_many_arguments))]
     pub async fn new(
         config: ReplicationConfig,
         p2p_node: Arc<P2PNode>,
@@ -169,6 +177,7 @@ impl ReplicationEngine {
         payment_verifier: Arc<PaymentVerifier>,
         root_dir: &Path,
         fresh_write_rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
+        #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         config.validate().map_err(Error::Config)?;
@@ -199,6 +208,8 @@ impl ReplicationEngine {
             bootstrap_complete_notify: Arc::new(Notify::new()),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             fresh_write_rx: Some(fresh_write_rx),
+            #[cfg(feature = "audit-exploit-test")]
+            storage_behavior,
             shutdown,
             task_handles: Vec::new(),
         })
@@ -367,6 +378,8 @@ impl ReplicationEngine {
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        #[cfg(feature = "audit-exploit-test")]
+        let storage_behavior = self.storage_behavior;
 
         let handle = tokio::spawn(async move {
             loop {
@@ -409,6 +422,8 @@ impl ReplicationEngine {
                                     &sync_history,
                                     &sync_cycle_epoch,
                                     &repair_proofs,
+                                    #[cfg(feature = "audit-exploit-test")]
+                                    storage_behavior,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -609,6 +624,8 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        #[cfg(feature = "audit-exploit-test")]
+        let storage_behavior = self.storage_behavior;
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -640,6 +657,8 @@ impl ReplicationEngine {
                         let config = Arc::clone(&config);
                         let token = shutdown.clone();
                         let fetch_key = candidate.key;
+                        #[cfg(feature = "audit-exploit-test")]
+                        let storage_behavior = storage_behavior;
                         in_flight.push(Box::pin(async move {
                             let handle = tokio::spawn(async move {
                                 // Cancel-aware: abort when the engine shuts down.
@@ -649,7 +668,13 @@ impl ReplicationEngine {
                                         result: FetchResult::SourceFailed,
                                     },
                                     outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
+                                        p2p,
+                                        storage,
+                                        config,
+                                        fetch_key,
+                                        source,
+                                        #[cfg(feature = "audit-exploit-test")]
+                                        storage_behavior,
                                     ) => outcome,
                                 }
                             });
@@ -696,6 +721,8 @@ impl ReplicationEngine {
                                         let config = Arc::clone(&config);
                                         let token = shutdown.clone();
                                         let fetch_key = key;
+                                        #[cfg(feature = "audit-exploit-test")]
+                                        let storage_behavior = storage_behavior;
                                         in_flight.push(Box::pin(async move {
                                             let handle = tokio::spawn(async move {
                                                 tokio::select! {
@@ -704,7 +731,13 @@ impl ReplicationEngine {
                                                         result: FetchResult::SourceFailed,
                                                     },
                                                     outcome = execute_single_fetch(
-                                                        p2p, storage, config, fetch_key, next_peer,
+                                                        p2p,
+                                                        storage,
+                                                        config,
+                                                        fetch_key,
+                                                        next_peer,
+                                                        #[cfg(feature = "audit-exploit-test")]
+                                                        storage_behavior,
                                                     ) => outcome,
                                                 }
                                             });
@@ -971,6 +1004,7 @@ async fn handle_replication_message(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
@@ -986,6 +1020,8 @@ async fn handle_replication_message(
                 payment_verifier,
                 p2p_node,
                 config,
+                #[cfg(feature = "audit-exploit-test")]
+                storage_behavior,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1029,6 +1065,8 @@ async fn handle_replication_message(
                 storage,
                 paid_list,
                 p2p_node,
+                #[cfg(feature = "audit-exploit-test")]
+                storage_behavior,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1053,6 +1091,10 @@ async fn handle_replication_message(
                 storage,
                 p2p_node,
                 bootstrapping,
+                #[cfg(feature = "audit-exploit-test")]
+                config,
+                #[cfg(feature = "audit-exploit-test")]
+                storage_behavior,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1080,6 +1122,7 @@ async fn handle_fresh_offer(
     payment_verifier: &Arc<PaymentVerifier>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1238,6 +1281,27 @@ async fn handle_fresh_offer(
     // Rule 6: add to PaidForList.
     if let Err(e) = paid_list.insert(&offer.key).await {
         warn!("Failed to add key to PaidForList: {e}");
+    }
+
+    #[cfg(feature = "audit-exploit-test")]
+    if storage_behavior.discards_chunks() {
+        info!(
+            "Storage behavior {:?}: accepting fresh replication offer for {} \
+             without local persistence",
+            storage_behavior,
+            hex::encode(offer.key),
+        );
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted {
+                key: offer.key,
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
     }
 
     // Store the record.
@@ -1442,12 +1506,16 @@ async fn handle_neighbor_sync_request(
     Ok(())
 }
 
+// The audit exploit feature adds one test-only behavior argument while leaving
+// the normal verification responder signature unchanged.
+#[cfg_attr(feature = "audit-exploit-test", allow(clippy::too_many_arguments))]
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
+    #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1477,6 +1545,13 @@ async fn handle_verification_request(
 
     let mut results = Vec::with_capacity(request.keys.len());
     for (i, key) in request.keys.iter().enumerate() {
+        #[cfg(feature = "audit-exploit-test")]
+        let present = if storage_behavior.claims_chunks_present() {
+            true
+        } else {
+            storage.exists(key).unwrap_or(false)
+        };
+        #[cfg(not(feature = "audit-exploit-test"))]
         let present = storage.exists(key).unwrap_or(false);
         let paid = if paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX)) {
             Some(paid_list.contains(key).unwrap_or(false))
@@ -1534,17 +1609,44 @@ async fn handle_fetch_request(
     Ok(())
 }
 
+// The audit exploit feature adds test-only config/behavior inputs while leaving
+// the normal audit responder signature unchanged.
+#[cfg_attr(feature = "audit-exploit-test", allow(clippy::too_many_arguments))]
 async fn handle_audit_challenge_msg(
     source: &PeerId,
     challenge: &protocol::AuditChallenge,
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
+    #[cfg(feature = "audit-exploit-test")] config: &ReplicationConfig,
+    #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
+    #[cfg(feature = "audit-exploit-test")]
+    let response = if storage_behavior.lazy_fetches_on_audit() {
+        audit::handle_audit_challenge_with_lazy_fetch(
+            challenge,
+            storage,
+            p2p_node,
+            source,
+            config,
+            is_bootstrapping,
+        )
+        .await
+    } else {
+        audit::handle_audit_challenge(
+            challenge,
+            storage,
+            p2p_node.peer_id(),
+            is_bootstrapping,
+            stored_chunks,
+        )
+        .await
+    };
+    #[cfg(not(feature = "audit-exploit-test"))]
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
@@ -2364,6 +2466,7 @@ async fn execute_single_fetch(
     config: Arc<ReplicationConfig>,
     key: XorName,
     source: PeerId,
+    #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
 ) -> FetchOutcome {
     let request = protocol::FetchRequest { key };
     let msg = ReplicationMessage {
@@ -2472,6 +2575,20 @@ async fn execute_single_fetch(
                         return FetchOutcome {
                             key,
                             result: FetchResult::IntegrityFailed,
+                        };
+                    }
+
+                    #[cfg(feature = "audit-exploit-test")]
+                    if storage_behavior.discards_chunks() {
+                        info!(
+                            "Storage behavior {:?}: accepting fetched record {} \
+                             without local persistence",
+                            storage_behavior,
+                            hex::encode(resp_key),
+                        );
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::Stored,
                         };
                     }
 

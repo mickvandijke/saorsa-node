@@ -63,6 +63,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{TestHarness, TestNetwork};
+    #[cfg(feature = "audit-exploit-test")]
+    use ant_node::config::StorageBehavior;
     use ant_node::payment::{
         EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
         QuotingMetricsTracker,
@@ -451,6 +453,8 @@ mod tests {
             Arc::new(storage),
             Arc::new(payment_verifier),
             Arc::new(quote_generator),
+            #[cfg(feature = "audit-exploit-test")]
+            StorageBehavior::Honest,
         );
 
         Ok((protocol, temp_dir, testnet))

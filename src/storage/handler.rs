@@ -32,9 +32,11 @@ use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
+    MerkleCandidateQuoteResponse, ProtocolError, XorName, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
 use crate::client::compute_address;
+#[cfg(feature = "audit-exploit-test")]
+use crate::config::StorageBehavior;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
@@ -58,6 +60,9 @@ pub struct AntProtocol {
     quote_generator: Arc<QuoteGenerator>,
     /// Channel for notifying the replication engine about newly-stored chunks.
     fresh_write_tx: Option<mpsc::UnboundedSender<FreshWriteEvent>>,
+    /// Controlled audit exploit storage behavior.
+    #[cfg(feature = "audit-exploit-test")]
+    storage_behavior: StorageBehavior,
 }
 
 impl AntProtocol {
@@ -73,6 +78,7 @@ impl AntProtocol {
         storage: Arc<LmdbStorage>,
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
+        #[cfg(feature = "audit-exploit-test")] storage_behavior: StorageBehavior,
     ) -> Self {
         // Keep the PaymentVerifier's freshness gate AND the QuoteGenerator's
         // pricing wired to the same authoritative store used by this protocol
@@ -90,6 +96,8 @@ impl AntProtocol {
             payment_verifier,
             quote_generator,
             fresh_write_tx: None,
+            #[cfg(feature = "audit-exploit-test")]
+            storage_behavior,
         }
     }
 
@@ -288,6 +296,11 @@ impl AntProtocol {
             }
         }
 
+        #[cfg(feature = "audit-exploit-test")]
+        if self.storage_behavior.discards_chunks() {
+            return self.accept_discarded_chunk(address, &addr_hex, request);
+        }
+
         // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
@@ -327,6 +340,34 @@ impl AntProtocol {
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
+    }
+
+    #[cfg(feature = "audit-exploit-test")]
+    fn accept_discarded_chunk(
+        &self,
+        address: XorName,
+        addr_hex: &str,
+        request: ChunkPutRequest,
+    ) -> ChunkPutResponse {
+        let content_len = request.content.len();
+        info!(
+            "Storage behavior {:?}: accepting chunk {addr_hex} ({content_len} bytes) \
+             without local persistence",
+            self.storage_behavior,
+        );
+
+        if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
+            let event = FreshWriteEvent {
+                key: address,
+                data: request.content.to_vec(),
+                payment_proof: proof,
+            };
+            if tx.send(event).is_err() {
+                debug!("Fresh-write channel closed, skipping replication for discarded {addr_hex}");
+            }
+        }
+
+        ChunkPutResponse::Success { address }
     }
 
     /// Handle a GET request.
@@ -594,7 +635,13 @@ mod tests {
                 .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
         });
 
-        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
+        let protocol = AntProtocol::new(
+            storage,
+            payment_verifier,
+            Arc::new(quote_generator),
+            #[cfg(feature = "audit-exploit-test")]
+            StorageBehavior::Honest,
+        );
         (protocol, temp_dir)
     }
 

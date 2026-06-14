@@ -1,6 +1,8 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+#[cfg(feature = "audit-exploit-test")]
+use crate::config::StorageBehavior;
 use crate::config::{
     default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
 };
@@ -33,6 +35,10 @@ use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
+const UNCONFIGURED_REWARDS_ADDRESS: &str = "0xYOUR_ARBITRUM_ADDRESS_HERE";
+const MISSING_REWARDS_ADDRESS_ERROR: &str = "CRITICAL: Rewards address is not configured. \
+     Set payment.rewards_address in config to your Arbitrum wallet address.";
+
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
     config: NodeConfig,
@@ -45,6 +51,59 @@ impl NodeBuilder {
         Self { config }
     }
 
+    fn validate_production_rewards_address(config: &NodeConfig) -> Result<()> {
+        if config.network_mode != NetworkMode::Production {
+            return Ok(());
+        }
+
+        if matches!(
+            config.payment.rewards_address.as_deref(),
+            Some(addr) if !addr.is_empty() && addr != UNCONFIGURED_REWARDS_ADDRESS
+        ) {
+            return Ok(());
+        }
+
+        Err(Error::Config(MISSING_REWARDS_ADDRESS_ERROR.to_string()))
+    }
+
+    #[cfg(feature = "audit-exploit-test")]
+    fn validate_storage_behavior(&self) -> Result<()> {
+        if self.config.storage.behavior == StorageBehavior::Honest {
+            return Ok(());
+        }
+        if self.config.network_mode == NetworkMode::Production {
+            return Err(Error::Config(
+                "CRITICAL: non-honest storage behavior is not allowed in production. \
+                 Use --network-mode testnet or development for audit exploit tests."
+                    .to_string(),
+            ));
+        }
+        warn!(
+            "Running controlled audit exploit storage behavior: {:?}",
+            self.config.storage.behavior
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "audit-exploit-test")]
+    fn validate_audit_exploit_replication_overrides(&self) -> Result<()> {
+        if !self.config.audit_exploit_test.has_replication_overrides() {
+            return Ok(());
+        }
+        if self.config.network_mode == NetworkMode::Production {
+            return Err(Error::Config(
+                "CRITICAL: audit exploit replication timing overrides are not allowed in \
+                 production. Use --network-mode testnet or development for audit exploit tests."
+                    .to_string(),
+            ));
+        }
+        warn!(
+            "Running controlled audit exploit replication timing overrides: {:?}",
+            self.config.audit_exploit_test
+        );
+        Ok(())
+    }
+
     /// Build and start the node.
     ///
     /// # Errors
@@ -53,26 +112,12 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building ant-node with config: {:?}", self.config);
 
-        // Validate rewards address in production
-        if self.config.network_mode == NetworkMode::Production {
-            match self.config.payment.rewards_address {
-                None => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(ref addr) if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
+        Self::validate_production_rewards_address(&self.config)?;
+
+        #[cfg(feature = "audit-exploit-test")]
+        self.validate_storage_behavior()?;
+        #[cfg(feature = "audit-exploit-test")]
+        self.validate_audit_exploit_replication_overrides()?;
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
@@ -133,6 +178,13 @@ impl NodeBuilder {
         // Initialize replication engine (if storage is enabled)
         let replication_engine =
             if let (Some(ref protocol), Some(fresh_rx)) = (&ant_protocol, fresh_write_rx) {
+                #[cfg(feature = "audit-exploit-test")]
+                let mut repl_config = ReplicationConfig::default();
+                #[cfg(feature = "audit-exploit-test")]
+                self.config
+                    .audit_exploit_test
+                    .apply_to_replication_config(&mut repl_config);
+                #[cfg(not(feature = "audit-exploit-test"))]
                 let repl_config = ReplicationConfig::default();
                 let storage_arc = protocol.storage();
                 let payment_verifier_arc = protocol.payment_verifier_arc();
@@ -143,6 +195,8 @@ impl NodeBuilder {
                     payment_verifier_arc,
                     &self.config.root_dir,
                     fresh_rx,
+                    #[cfg(feature = "audit-exploit-test")]
+                    self.config.storage.behavior,
                     shutdown.clone(),
                 )
                 .await
@@ -391,7 +445,13 @@ impl NodeBuilder {
         let storage = Arc::new(storage);
         let payment_verifier = Arc::new(payment_verifier);
 
-        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
+        let protocol = AntProtocol::new(
+            storage,
+            payment_verifier,
+            Arc::new(quote_generator),
+            #[cfg(feature = "audit-exploit-test")]
+            config.storage.behavior,
+        );
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={CHUNK_PROTOCOL_ID})"
